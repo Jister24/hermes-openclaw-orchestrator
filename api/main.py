@@ -54,6 +54,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None, None]:
 
     # Load config from environment
     import os
+    from dotenv import load_dotenv
+    
+    # Load environment variables from .env file
+    load_dotenv()
+    
     gateway_url = os.getenv("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789")
     auth_token = os.getenv("OPENCLAW_AUTH_TOKEN", "")
 
