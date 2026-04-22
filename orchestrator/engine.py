@@ -26,6 +26,16 @@ from shared.types import (
     TaskStatusResponse,
 )
 
+# Optional EventBus — gracefully degrade when not available
+try:
+    from orchestrator.events import EventBus, DashboardEvent, DashboardEventPayload
+    _HAS_EVENTBUS = True
+except ImportError:
+    _HAS_EVENTBUS = False
+    EventBus = None
+    DashboardEvent = None
+    DashboardEventPayload = None
+
 logger = structlog.get_logger(__name__)
 
 
@@ -232,6 +242,7 @@ class OrchestrationEngine:
         registry: AgentRegistry,
         max_parallel: int = 3,
         progress_callback: Optional[Callable[[TaskStatusResponse], None]] = None,
+        event_bus: Optional[Any] = None,
     ):
         self.connector = connector
         self.registry = registry
@@ -239,6 +250,7 @@ class OrchestrationEngine:
         self.scheduler = TaskScheduler(max_parallel=max_parallel)
         self.max_parallel = max_parallel
         self.progress_callback = progress_callback
+        self.event_bus = event_bus  # May be None (optional dependency)
 
         # In-flight tracking
         self._running_tasks: dict[str, asyncio.Task] = {}
@@ -261,6 +273,11 @@ class OrchestrationEngine:
             num_subtasks=len(subtasks),
         )
 
+        # Emit event for dashboard
+        if _HAS_EVENTBUS and self.event_bus:
+            plan_for_event = [{"id": st.id, "description": st.description, "agent": st.agent_type} for st in subtasks]
+            asyncio.create_task(self.event_bus.emit_task_started(orchestration_task.id, plan_for_event))
+
         # Step 2: Execute subtasks
         await self._execute_subtasks(orchestration_task)
 
@@ -274,24 +291,34 @@ class OrchestrationEngine:
 
     async def _execute_subtasks(self, task: OrchestrationTask) -> None:
         """Execute subtasks with dependency awareness and parallel scheduling."""
+        await self._execute_subtasks_standalone(task.subtasks)
+
+    async def _execute_subtasks_standalone(self, subtasks: list[SubTask]) -> None:
+        """Execute a list of subtasks directly (standalone version for background execution)."""
         running_ids: set[str] = set()
         completed_ids: set[str] = set()
         failed_ids: set[str] = set()
+        self._running_tasks: dict[str, asyncio.Task] = {}
 
         while True:
             # Check for completed tasks
             done = [tid for tid in running_ids if tid not in self._running_tasks]
             for tid in done:
-                if tid in self._running_tasks:
-                    del self._running_tasks[tid]
+                running_ids.discard(tid)
 
             # Get next batch of ready tasks
-            ready = self.scheduler.get_ready_tasks(task.subtasks, completed_ids)
+            ready = self.scheduler.get_ready_tasks(subtasks, completed_ids)
             slots = self.max_parallel - len(running_ids)
 
             for subtask in ready[:slots]:
                 subtask.status = TaskStatus.RUNNING
                 subtask.started_at = datetime.utcnow()
+
+                # Emit EventBus: subtask started
+                if _HAS_EVENTBUS and self.event_bus:
+                    asyncio.create_task(self.event_bus.emit_subtask_started(
+                        "background", subtask.id, subtask.agent_type, subtask.description
+                    ))
 
                 # Find agent info
                 agent_info = self.registry.find_best_agent(
@@ -312,7 +339,7 @@ class OrchestrationEngine:
                 running_ids.add(subtask.id)
 
                 # Spawn execution task
-                coro = self._run_subtask(subtask, agent_info, task)
+                coro = self._run_subtask_standalone(subtask, agent_info)
                 asyncio_task = asyncio.create_task(coro)
                 self._running_tasks[subtask.id] = asyncio_task
 
@@ -329,6 +356,7 @@ class OrchestrationEngine:
                 for pending in done_pending:
                     result = pending.result()
                     task_id = result["task_id"]
+                    running_ids.discard(task_id)
                     if result["status"] == TaskStatus.COMPLETED.value:
                         completed_ids.add(task_id)
                     else:
@@ -340,6 +368,9 @@ class OrchestrationEngine:
 
             # Small yield
             await asyncio.sleep(0.1)
+
+        # Cleanup
+        self._running_tasks.clear()
 
         # Update final task status
         task.completed_at = datetime.utcnow()
@@ -355,6 +386,13 @@ class OrchestrationEngine:
             failed=len(failed_ids),
         )
 
+        # Emit EventBus final event
+        if _HAS_EVENTBUS and self.event_bus:
+            if failed_ids:
+                asyncio.create_task(self.event_bus.emit_task_failed(task.id, f"{len(failed_ids)} subtask(s) failed"))
+            else:
+                asyncio.create_task(self.event_bus.emit_task_completed(task.id, task.metadata.get("subtask_results")))
+
     async def _run_subtask(
         self,
         subtask: SubTask,
@@ -362,8 +400,36 @@ class OrchestrationEngine:
         orchestration_task: OrchestrationTask,
     ) -> dict[str, Any]:
         """Run a single subtask and update its status."""
+        return await self._run_subtask_standalone(subtask, agent_info, orchestration_task)
+
+    async def _run_subtask_standalone(
+        self,
+        subtask: SubTask,
+        agent_info: AgentInfo,
+        orchestration_task: Optional[OrchestrationTask] = None,
+    ) -> dict[str, Any]:
+        """Run a single subtask (standalone version)."""
+        task_id = orchestration_task.id if orchestration_task else subtask.id
+
+        # Start concurrent thinking heartbeat (emits AGENT_THINKING every 2s)
+        thinking_task: Optional[asyncio.Task] = None
+        if _HAS_EVENTBUS and self.event_bus:
+            async def _thinking_heartbeat():
+                """Emit AGENT_THINKING events periodically while subtask runs."""
+                try:
+                    while True:
+                        await asyncio.sleep(2)
+                        await self.event_bus.emit_agent_thinking(task_id, subtask.id)
+                except asyncio.CancelledError:
+                    pass
+            thinking_task = asyncio.create_task(_thinking_heartbeat())
+
         try:
             result = await self.connector.execute_subtask(agent_info, subtask)
+
+            # Cancel thinking heartbeat
+            if thinking_task and not thinking_task.done():
+                thinking_task.cancel()
 
             # Update subtask
             subtask.result = result.get("result")
@@ -371,13 +437,20 @@ class OrchestrationEngine:
             subtask.error = result.get("error")
             subtask.completed_at = datetime.utcnow()
 
-            # Aggregate results into orchestration task
-            if subtask.result:
+            # Aggregate results into orchestration task (if available)
+            if subtask.result and orchestration_task:
                 orchestration_task.metadata.setdefault("subtask_results", {})[subtask.id] = subtask.result
 
             # Progress callback
-            if self.progress_callback:
+            if self.progress_callback and orchestration_task:
                 self.progress_callback(self.get_task_status(orchestration_task))
+
+            # Emit EventBus events for dashboard
+            if _HAS_EVENTBUS and self.event_bus:
+                asyncio.create_task(self.event_bus.emit_subtask_completed(
+                    task_id, subtask.id, agent_info.agent_id, result.get("result")
+                ))
+                asyncio.create_task(self.event_bus.emit_stream_done(task_id, subtask.id))
 
             return result
 
@@ -386,6 +459,17 @@ class OrchestrationEngine:
             subtask.error = str(e)
             subtask.completed_at = datetime.utcnow()
             logger.error("subtask_execution_error", task_id=subtask.id, error=str(e))
+
+            # Cancel thinking heartbeat
+            if thinking_task and not thinking_task.done():
+                thinking_task.cancel()
+
+            # Emit EventBus failure event
+            if _HAS_EVENTBUS and self.event_bus:
+                asyncio.create_task(self.event_bus.emit_subtask_failed(
+                    task_id, subtask.id, agent_info.agent_id, str(e)
+                ))
+
             return {
                 "task_id": subtask.id,
                 "agent_id": agent_info.agent_id,

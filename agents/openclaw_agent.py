@@ -433,30 +433,52 @@ class OpenClawAgentClient:
         The session is created with the agent_id, and the message is sent
         via sessions.send to trigger the subagent's response.
 
+        context can contain:
+          - model: str  — model identifier (e.g. "minimax/MiniMax-M2")
+          - temperature: float  — sampling temperature (0.0–2.0)
+
         Returns dict with sessionKey and response.
         """
+        ctx = context or {}
+        model = ctx.get("model")
+        temperature = ctx.get("temperature")
+
         logger.info(
             "spawning_subagent",
             agent_id=agent_id,
+            model=model,
+            temperature=temperature,
             task_preview=message[:100],
         )
-
-        extra_context: dict[str, Any] = {}
-        if context:
-            extra_context["context"] = context
 
         try:
             create_params: dict[str, Any] = {
                 "agentId": agent_id,
                 "message": message,
-                **extra_context,
             }
+            if model:
+                create_params["model"] = model
 
             create_result = await self._ws_client.rpc(
                 "sessions.create",
                 create_params,
                 timeout=min(timeout, self.timeout),
             )
+
+            session_key = create_result.get("key")
+            if not session_key:
+                raise GatewayError(f"sessions.create returned no session key: {create_result}")
+
+            # Apply temperature override via session patch (after create, before/after send)
+            if temperature is not None and session_key:
+                try:
+                    await self._ws_client.rpc(
+                        "sessions.patch",
+                        {"key": session_key, "temperature": float(temperature)},
+                        timeout=10,
+                    )
+                except Exception as patch_err:
+                    logger.warning("session_patch_temperature_failed", error=str(patch_err))
 
             session_key = create_result.get("key")
             if not session_key:
